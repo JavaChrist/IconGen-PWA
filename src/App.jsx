@@ -4,6 +4,15 @@ import { saveAs } from "file-saver";
 import "./App.css";
 
 const SIZES = [16, 32, 48, 64, 96, 128, 192, 256, 384, 512];
+const PRESET_COLORS = [
+  "#000000",
+  "#0b0b0b",
+  "#111111",
+  "#1f2937",
+  "#ffffff",
+  "#f5f5f5",
+  "#3b82f6",
+];
 
 function canvasFromImage(img, size, background = "#ffffff") {
   const canvas = document.createElement("canvas");
@@ -33,12 +42,17 @@ async function imageBitmapFromFile(file) {
 }
 
 function App() {
+  const [files, setFiles] = useState([]);
   const [file, setFile] = useState(null);
   const [bg, setBg] = useState("#ffffff");
   const [transparent, setTransparent] = useState(true);
+  const [iosWhiteOnly, setIosWhiteOnly] = useState(false);
   const [busy, setBusy] = useState(false);
   const [previews, setPreviews] = useState([]);
+  const [sizesStr, setSizesStr] = useState(SIZES.join(","));
+  const [batchMode, setBatchMode] = useState(true);
   const inputRef = useRef(null);
+  const dropRef = useRef(null);
   const [previewOpen, setPreviewOpen] = useState(false);
 
   const manifestSnippet = useMemo(() => {
@@ -70,12 +84,15 @@ function App() {
 
   const handlePick = useCallback(() => inputRef.current?.click(), []);
 
-  const onFile = useCallback(
-    async (f) => {
-      if (!f) return;
-      setFile(f);
-      // preview base
-      const img = await imageBitmapFromFile(f);
+  const onFiles = useCallback(
+    async (list) => {
+      const arr = Array.from(list || []).filter((f) =>
+        f.type.startsWith("image/")
+      );
+      if (arr.length === 0) return;
+      setFiles(arr);
+      setFile(arr[0]);
+      const img = await imageBitmapFromFile(arr[0]);
       const pv = [64, 192, 512].map((s) =>
         canvasFromImage(img, s, transparent ? null : bg).toDataURL("image/png")
       );
@@ -84,10 +101,35 @@ function App() {
     [bg, transparent]
   );
 
-  const onInputChange = useCallback(
-    (e) => onFile(e.target.files?.[0]),
-    [onFile]
-  );
+  const onInputChange = useCallback((e) => onFiles(e.target.files), [onFiles]);
+
+  useEffect(() => {
+    const el = dropRef.current;
+    if (!el) return;
+    const prevent = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    const onDrop = (e) => {
+      prevent(e);
+      onFiles(e.dataTransfer.files);
+    };
+    el.addEventListener("dragover", prevent);
+    el.addEventListener("drop", onDrop);
+    return () => {
+      el.removeEventListener("dragover", prevent);
+      el.removeEventListener("drop", onDrop);
+    };
+  }, [onFiles]);
+
+  useEffect(() => {
+    const onPaste = (e) => {
+      const items = e.clipboardData?.files;
+      if (items && items.length) onFiles(items);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [onFiles]);
 
   // Met à jour les aperçus quand la couleur de fond ou la transparence change
   useEffect(() => {
@@ -101,44 +143,93 @@ function App() {
     })();
   }, [bg, transparent, file]);
 
+  // LocalStorage: charger
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("icongenSettings");
+      if (raw) {
+        const s = JSON.parse(raw);
+        if (typeof s.bg === "string") setBg(s.bg);
+        if (typeof s.transparent === "boolean") setTransparent(s.transparent);
+        if (typeof s.sizesStr === "string") setSizesStr(s.sizesStr);
+      }
+    } catch {}
+  }, []);
+
+  // LocalStorage: sauvegarder
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "icongenSettings",
+        JSON.stringify({ bg, transparent, sizesStr })
+      );
+    } catch {}
+  }, [bg, transparent, sizesStr]);
+
+  function parseSizes(input) {
+    const parsed = String(input || "")
+      .split(/[,\s]+/)
+      .map((v) => parseInt(v, 10))
+      .filter((n) => Number.isFinite(n) && n >= 8 && n <= 2048);
+    const unique = Array.from(new Set(parsed));
+    return unique.length ? unique : SIZES;
+  }
+
   const generateZip = useCallback(async () => {
-    if (!file) return;
+    const list = files && files.length ? files : file ? [file] : [];
+    if (!list.length) return;
     setBusy(true);
     try {
-      const img = await imageBitmapFromFile(file);
+      const sizes = parseSizes(sizesStr);
       const zip = new JSZip();
-      const useBg = transparent ? null : bg;
-      for (const size of SIZES) {
-        const c = canvasFromImage(img, size, useBg);
-        const blob = await new Promise((r) => c.toBlob(r, "image/png", 0.92));
-        zip.file(`logo${size}.png`, blob);
+      for (const f of list) {
+        // eslint-disable-next-line no-await-in-loop
+        const img = await imageBitmapFromFile(f);
+        const baseName = (f.name || "image").replace(/\.[^.]+$/, "");
+        const dir = list.length > 1 ? zip.folder(baseName) : zip;
+        const useBg = transparent ? null : bg;
+        for (const size of sizes) {
+          const c = canvasFromImage(img, size, useBg);
+          // eslint-disable-next-line no-await-in-loop
+          const blob = await new Promise((r) => c.toBlob(r, "image/png", 0.92));
+          dir.file(`logo${size}.png`, blob);
+        }
+        // iOS
+        const iosBg = iosWhiteOnly ? "#ffffff" : useBg;
+        const c180 = canvasFromImage(img, 180, iosBg);
+        dir.file(
+          "apple-touch-icon.png",
+          await new Promise((r) => c180.toBlob(r, "image/png", 0.92))
+        );
+        const c192 = canvasFromImage(img, 192, iosBg);
+        dir.file(
+          "apple-touch-icon-3d.png",
+          await new Promise((r) => c192.toBlob(r, "image/png", 0.92))
+        );
+        dir.file("SNIPPET_manifest.json", manifestSnippet);
+        dir.file("SNIPPET_head.html", headSnippet);
       }
-      // iOS
-      const c180 = canvasFromImage(img, 180, useBg);
-      zip.file(
-        "apple-touch-icon.png",
-        await new Promise((r) => c180.toBlob(r, "image/png", 0.92))
-      );
-      // copy for 167/152 (fallback 3d look handled by background)
-      const c192 = canvasFromImage(img, 192, useBg);
-      zip.file(
-        "apple-touch-icon-3d.png",
-        await new Promise((r) => c192.toBlob(r, "image/png", 0.92))
-      );
-
-      // snippets
-      zip.file("SNIPPET_manifest.json", manifestSnippet);
-      zip.file("SNIPPET_head.html", headSnippet);
-
       const content = await zip.generateAsync({ type: "blob" });
-      saveAs(content, "icons-pwa.zip");
+      saveAs(
+        content,
+        list.length > 1 ? "icons-pwa-batch.zip" : "icons-pwa.zip"
+      );
     } finally {
       setBusy(false);
     }
-  }, [file, bg, transparent, manifestSnippet, headSnippet]);
+  }, [
+    files,
+    file,
+    bg,
+    transparent,
+    sizesStr,
+    manifestSnippet,
+    headSnippet,
+    iosWhiteOnly,
+  ]);
 
   return (
-    <div style={{ maxWidth: 960, margin: "0 auto", padding: 24 }}>
+    <div ref={dropRef} style={{ maxWidth: 960, margin: "0 auto", padding: 24 }}>
       <div
         style={{
           display: "flex",
@@ -160,6 +251,25 @@ function App() {
         Charge une image carrée (512×512 recommandé). Fond non transparent
         conseillé pour iOS.
       </p>
+      <div
+        onClick={handlePick}
+        title="Dépose tes images ici ou clique pour sélectionner"
+        style={{
+          border: "1px dashed #333",
+          borderRadius: 8,
+          background: "#0b0b0b",
+          padding: 20,
+          marginBottom: 16,
+          cursor: "pointer",
+          textAlign: "center",
+          color: "#9ca3af",
+        }}
+      >
+        Dépose tes images ici ou clique pour sélectionner
+        <div style={{ fontSize: 12, marginTop: 6 }}>
+          Mode lot: actif (plusieurs fichiers acceptés)
+        </div>
+      </div>
       <div
         style={{
           display: "flex",
@@ -187,6 +297,25 @@ function App() {
             disabled={transparent}
           />
         </label>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+          {PRESET_COLORS.map((c) => (
+            <button
+              key={c}
+              onClick={() => {
+                setBg(c);
+                setTransparent(false);
+              }}
+              style={{
+                width: 18,
+                height: 18,
+                borderRadius: 4,
+                border: "1px solid #333",
+                background: c,
+              }}
+              title={c}
+            />
+          ))}
+        </div>
         <label style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
           <input
             type="checkbox"
@@ -194,6 +323,31 @@ function App() {
             onChange={(e) => setTransparent(e.target.checked)}
           />
           <span>Fond transparent</span>
+        </label>
+        <label style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={iosWhiteOnly}
+            onChange={(e) => setIosWhiteOnly(e.target.checked)}
+          />
+          <span>Fond blanc iOS uniquement</span>
+        </label>
+        <label style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+          <span>Tailles</span>
+          <input
+            type="text"
+            value={sizesStr}
+            onChange={(e) => setSizesStr(e.target.value)}
+            placeholder="16,32,48,64,96,128,192,256,384,512"
+            style={{
+              width: 240,
+              background: "#0b0b0b",
+              color: "#e5e7eb",
+              border: "1px solid #333",
+              borderRadius: 6,
+              padding: "6px 8px",
+            }}
+          />
         </label>
         <button onClick={generateZip} disabled={!file || busy}>
           {busy ? "Génération..." : "Générer ZIP"}
