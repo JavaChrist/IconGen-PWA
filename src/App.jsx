@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import JSZip from "jszip";
 import { saveAs } from "file-saver";
 import "./App.css";
@@ -32,11 +32,6 @@ async function imageBitmapFromFile(file) {
   return await createImageBitmap(blob);
 }
 
-function downloadText(filename, content) {
-  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-  saveAs(blob, filename);
-}
-
 function App() {
   const [file, setFile] = useState(null);
   const [bg, setBg] = useState("#ffffff");
@@ -44,6 +39,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [previews, setPreviews] = useState([]);
   const inputRef = useRef(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
 
   const manifestSnippet = useMemo(() => {
     return `{
@@ -93,6 +89,18 @@ function App() {
     [onFile]
   );
 
+  // Met à jour les aperçus quand la couleur de fond ou la transparence change
+  useEffect(() => {
+    (async () => {
+      if (!file) return;
+      const img = await imageBitmapFromFile(file);
+      const pv = [64, 192, 512].map((s) =>
+        canvasFromImage(img, s, transparent ? null : bg).toDataURL("image/png")
+      );
+      setPreviews(pv);
+    })();
+  }, [bg, transparent, file]);
+
   const generateZip = useCallback(async () => {
     if (!file) return;
     setBusy(true);
@@ -131,7 +139,23 @@ function App() {
 
   return (
     <div style={{ maxWidth: 960, margin: "0 auto", padding: 24 }}>
-      <h1 style={{ marginBottom: 8 }}>IconGen PWA</h1>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          marginBottom: 8,
+        }}
+      >
+        <img
+          src="/logo64.png"
+          alt="IconGen"
+          width={56}
+          height={56}
+          style={{ borderRadius: 8 }}
+        />
+        <h1 style={{ margin: 0 }}>IconGen PWA</h1>
+      </div>
       <p style={{ color: "#9ca3af", marginTop: 0 }}>
         Charge une image carrée (512×512 recommandé). Fond non transparent
         conseillé pour iOS.
@@ -174,6 +198,9 @@ function App() {
         <button onClick={generateZip} disabled={!file || busy}>
           {busy ? "Génération..." : "Générer ZIP"}
         </button>
+        <button onClick={() => setPreviewOpen(true)} disabled={!file}>
+          Aperçu iOS/Android
+        </button>
       </div>
 
       {previews.length > 0 && (
@@ -198,6 +225,136 @@ function App() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {previewOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.6)",
+            display: "grid",
+            placeItems: "center",
+            padding: 16,
+            zIndex: 50,
+          }}
+          onClick={() => setPreviewOpen(false)}
+        >
+          <div
+            style={{
+              width: "min(1200px, 96vw)",
+              height: "min(96vh, 980px)",
+              background: "#0b0b0b",
+              border: "1px solid #333",
+              borderRadius: 12,
+              padding: 16,
+              boxShadow: "0 10px 30px rgba(0,0,0,0.4)",
+              display: "flex",
+              flexDirection: "column",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: 12,
+              }}
+            >
+              <div style={{ fontWeight: 600 }}>Aperçu iOS / Android</div>
+              <button onClick={() => setPreviewOpen(false)}>Fermer</button>
+            </div>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                gap: 16,
+                flex: 1,
+                overflow: "auto",
+                paddingBottom: 8,
+              }}
+            >
+              <div>
+                <div style={{ color: "#9ca3af", marginBottom: 8 }}>
+                  Android (maskable)
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 16,
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  {[192, 512].map((s, i) => (
+                    <div key={i} style={{ textAlign: "center" }}>
+                      <img
+                        src={previews[i === 0 ? 1 : 2]}
+                        alt="android"
+                        style={{
+                          width: s / 2,
+                          height: s / 2,
+                          borderRadius: 24,
+                          border: "1px solid #333",
+                          background: "#111",
+                        }}
+                      />
+                      <div style={{ color: "#9ca3af", marginTop: 6 }}>
+                        {s} maskable
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div style={{ color: "#9ca3af", marginBottom: 8 }}>
+                  iOS (apple-touch)
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 16,
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  {[180, 167, 152].map((s, i) => (
+                    <div key={i} style={{ textAlign: "center" }}>
+                      <img
+                        src={previews[i === 0 ? 0 : 1]}
+                        alt="ios"
+                        style={{
+                          width: s / 2,
+                          height: s / 2,
+                          borderRadius: 24,
+                          border: "1px solid #333",
+                          background: "#111",
+                        }}
+                      />
+                      <div style={{ color: "#9ca3af", marginTop: 6 }}>{s}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "flex-end",
+                gap: 8,
+                borderTop: "1px solid #222",
+                paddingTop: 12,
+              }}
+            >
+              <button onClick={generateZip} disabled={!file || busy}>
+                {busy ? "Génération..." : "Télécharger ZIP"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
