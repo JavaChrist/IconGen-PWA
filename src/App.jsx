@@ -4,6 +4,7 @@ import { saveAs } from "file-saver";
 import "./App.css";
 
 const SIZES = [16, 32, 48, 64, 96, 128, 192, 256, 384, 512];
+const MASKABLE_SIZES = new Set([192, 512]);
 const PRESET_COLORS = [
   "#000000",
   "#0b0b0b",
@@ -13,6 +14,14 @@ const PRESET_COLORS = [
   "#f5f5f5",
   "#3b82f6",
 ];
+
+const DEFAULT_SETTINGS = {
+  bg: "#ffffff",
+  transparent: true,
+  sizesStr: SIZES.join(","),
+  iosWhiteOnly: false,
+  maskableSafeBg: true,
+};
 
 function canvasFromImage(img, size, background = "#ffffff") {
   const canvas = document.createElement("canvas");
@@ -41,26 +50,121 @@ async function imageBitmapFromFile(file) {
   return await createImageBitmap(blob);
 }
 
+// Construit un fichier .ico (format ICONDIR) contenant plusieurs images PNG
+// embarquées, méthode supportée nativement depuis Windows Vista.
+function buildIco(pngEntries) {
+  const count = pngEntries.length;
+  const headerSize = 6 + 16 * count;
+  let offset = headerSize;
+
+  const header = new Uint8Array(headerSize);
+  const dv = new DataView(header.buffer);
+  dv.setUint16(0, 0, true); // reserved
+  dv.setUint16(2, 1, true); // type: 1 = icon
+  dv.setUint16(4, count, true);
+
+  let entryOffset = 6;
+  for (const { width, height, buffer } of pngEntries) {
+    dv.setUint8(entryOffset, width >= 256 ? 0 : width);
+    dv.setUint8(entryOffset + 1, height >= 256 ? 0 : height);
+    dv.setUint8(entryOffset + 2, 0); // palette
+    dv.setUint8(entryOffset + 3, 0); // reserved
+    dv.setUint16(entryOffset + 4, 1, true); // planes
+    dv.setUint16(entryOffset + 6, 32, true); // bits per pixel
+    dv.setUint32(entryOffset + 8, buffer.byteLength, true);
+    dv.setUint32(entryOffset + 12, offset, true);
+    entryOffset += 16;
+    offset += buffer.byteLength;
+  }
+
+  const result = new Uint8Array(offset);
+  result.set(header, 0);
+  let pos = headerSize;
+  for (const { buffer } of pngEntries) {
+    result.set(new Uint8Array(buffer), pos);
+    pos += buffer.byteLength;
+  }
+  return result;
+}
+
+const FAVICON_SIZES = [16, 32, 48];
+
+async function buildFaviconIco(img, background) {
+  const entries = [];
+  for (const size of FAVICON_SIZES) {
+    const c = canvasFromImage(img, size, background);
+     
+    const blob = await new Promise((r) => c.toBlob(r, "image/png"));
+     
+    const buffer = await blob.arrayBuffer();
+    entries.push({ width: size, height: size, buffer });
+  }
+  return buildIco(entries);
+}
+
+// Favicon vectoriel: encapsule un PNG haute résolution dans un conteneur SVG.
+// Les navigateurs modernes le préfèrent au .ico et l'affichent net à toute taille.
+function buildSvgFavicon(img, background, size = 512) {
+  const canvas = canvasFromImage(img, size, background);
+  const dataUrl = canvas.toDataURL("image/png");
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}"><image width="${size}" height="${size}" href="${dataUrl}"/></svg>`;
+}
+
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function CopyButton({ text, label = "Copier" }) {
+  const [copied, setCopied] = useState(false);
+  const onClick = useCallback(async () => {
+    const ok = await copyToClipboard(text);
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }
+  }, [text]);
+  return (
+    <button onClick={onClick} type="button">
+      {copied ? "Copié !" : label}
+    </button>
+  );
+}
+
 function App() {
   const [files, setFiles] = useState([]);
   const [file, setFile] = useState(null);
-  const [bg, setBg] = useState("#ffffff");
-  const [transparent, setTransparent] = useState(true);
-  const [iosWhiteOnly, setIosWhiteOnly] = useState(false);
+  const [thumbs, setThumbs] = useState([]); // [{ file, url }]
+  const [bg, setBg] = useState(DEFAULT_SETTINGS.bg);
+  const [transparent, setTransparent] = useState(DEFAULT_SETTINGS.transparent);
+  const [iosWhiteOnly, setIosWhiteOnly] = useState(
+    DEFAULT_SETTINGS.iosWhiteOnly
+  );
+  const [maskableSafeBg, setMaskableSafeBg] = useState(
+    DEFAULT_SETTINGS.maskableSafeBg
+  );
   const [busy, setBusy] = useState(false);
   const [previews, setPreviews] = useState([]);
-  const [sizesStr, setSizesStr] = useState(SIZES.join(","));
-  const [batchMode, setBatchMode] = useState(true);
+  const [sizesStr, setSizesStr] = useState(DEFAULT_SETTINGS.sizesStr);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [error, setError] = useState("");
+  const [progress, setProgress] = useState({ current: 0, total: 0 });
   const inputRef = useRef(null);
   const dropRef = useRef(null);
-  const [previewOpen, setPreviewOpen] = useState(false);
+
+  const themeColor = transparent ? "#3b82f6" : bg;
+  const backgroundColor = transparent ? "#ffffff" : bg;
 
   const manifestSnippet = useMemo(() => {
     return `{
 	  "name": "IconGen PWA",
 	  "short_name": "IconGen",
-	  "theme_color": "#3b82f6",
-	  "background_color": "#ffffff",
+	  "theme_color": "${themeColor}",
+	  "background_color": "${backgroundColor}",
 	  "display": "standalone",
 	  "start_url": "/",
 	  "icons": [
@@ -68,19 +172,20 @@ function App() {
 	    { "src": "/logo512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
 	  ]
 	}`;
-  }, []);
+  }, [themeColor, backgroundColor]);
 
   const headSnippet = useMemo(() => {
     return `<!-- Theme & Icons -->
-<meta name="theme-color" content="#3b82f6" />
+<meta name="theme-color" content="${themeColor}" />
 <link rel="icon" type="image/png" sizes="16x16" href="/logo16.png" />
 <link rel="icon" type="image/png" sizes="32x32" href="/logo32.png" />
 <link rel="icon" type="image/png" sizes="48x48" href="/logo48.png" />
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 <link rel="icon" type="image/x-icon" href="/favicon.ico" />
 <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
 <link rel="apple-touch-icon" sizes="167x167" href="/apple-touch-icon-3d.png" />
 <link rel="apple-touch-icon" sizes="152x152" href="/apple-touch-icon-3d.png" />`;
-  }, []);
+  }, [themeColor]);
 
   const handlePick = useCallback(() => inputRef.current?.click(), []);
 
@@ -90,13 +195,29 @@ function App() {
         f.type.startsWith("image/")
       );
       if (arr.length === 0) return;
-      setFiles(arr);
-      setFile(arr[0]);
-      const img = await imageBitmapFromFile(arr[0]);
-      const pv = [64, 192, 512].map((s) =>
-        canvasFromImage(img, s, transparent ? null : bg).toDataURL("image/png")
-      );
-      setPreviews(pv);
+      setError("");
+      try {
+        setFiles(arr);
+        setFile(arr[0]);
+        setThumbs((prev) => {
+          prev.forEach((t) => URL.revokeObjectURL(t.url));
+          return arr.map((f) => ({ file: f, url: URL.createObjectURL(f) }));
+        });
+        const img = await imageBitmapFromFile(arr[0]);
+        const pv = [64, 192, 512].map((s) =>
+          canvasFromImage(img, s, transparent ? null : bg).toDataURL(
+            "image/png"
+          )
+        );
+        img.close?.();
+        setPreviews(pv);
+      } catch (e) {
+        setError(
+          `Impossible de lire le fichier image sélectionné (${
+            e?.message || "format non supporté"
+          }).`
+        );
+      }
     },
     [bg, transparent]
   );
@@ -131,15 +252,32 @@ function App() {
     return () => window.removeEventListener("paste", onPaste);
   }, [onFiles]);
 
+  // Révoque les URL des miniatures à la fermeture du composant
+  useEffect(() => {
+    return () => {
+      thumbs.forEach((t) => URL.revokeObjectURL(t.url));
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Met à jour les aperçus quand la couleur de fond ou la transparence change
   useEffect(() => {
     (async () => {
       if (!file) return;
-      const img = await imageBitmapFromFile(file);
-      const pv = [64, 192, 512].map((s) =>
-        canvasFromImage(img, s, transparent ? null : bg).toDataURL("image/png")
-      );
-      setPreviews(pv);
+      try {
+        const img = await imageBitmapFromFile(file);
+        const pv = [64, 192, 512].map((s) =>
+          canvasFromImage(img, s, transparent ? null : bg).toDataURL(
+            "image/png"
+          )
+        );
+        img.close?.();
+        setPreviews(pv);
+      } catch (e) {
+        setError(
+          `Impossible de générer l'aperçu (${e?.message || "erreur inconnue"}).`
+        );
+      }
     })();
   }, [bg, transparent, file]);
 
@@ -152,8 +290,14 @@ function App() {
         if (typeof s.bg === "string") setBg(s.bg);
         if (typeof s.transparent === "boolean") setTransparent(s.transparent);
         if (typeof s.sizesStr === "string") setSizesStr(s.sizesStr);
+        if (typeof s.iosWhiteOnly === "boolean")
+          setIosWhiteOnly(s.iosWhiteOnly);
+        if (typeof s.maskableSafeBg === "boolean")
+          setMaskableSafeBg(s.maskableSafeBg);
       }
-    } catch {}
+    } catch {
+      // paramètres locaux corrompus ou indisponibles: on ignore et garde les valeurs par défaut
+    }
   }, []);
 
   // LocalStorage: sauvegarder
@@ -161,10 +305,32 @@ function App() {
     try {
       localStorage.setItem(
         "icongenSettings",
-        JSON.stringify({ bg, transparent, sizesStr })
+        JSON.stringify({
+          bg,
+          transparent,
+          sizesStr,
+          iosWhiteOnly,
+          maskableSafeBg,
+        })
       );
-    } catch {}
-  }, [bg, transparent, sizesStr]);
+    } catch {
+      // stockage indisponible (mode privé, quota atteint...): on ignore silencieusement
+    }
+  }, [bg, transparent, sizesStr, iosWhiteOnly, maskableSafeBg]);
+
+  const resetSettings = useCallback(() => {
+    setBg(DEFAULT_SETTINGS.bg);
+    setTransparent(DEFAULT_SETTINGS.transparent);
+    setSizesStr(DEFAULT_SETTINGS.sizesStr);
+    setIosWhiteOnly(DEFAULT_SETTINGS.iosWhiteOnly);
+    setMaskableSafeBg(DEFAULT_SETTINGS.maskableSafeBg);
+    setError("");
+    try {
+      localStorage.removeItem("icongenSettings");
+    } catch {
+      // ignore
+    }
+  }, []);
 
   function parseSizes(input) {
     const parsed = String(input || "")
@@ -179,43 +345,85 @@ function App() {
     const list = files && files.length ? files : file ? [file] : [];
     if (!list.length) return;
     setBusy(true);
+    setError("");
+    const sizes = parseSizes(sizesStr);
+    // sizes + apple-touch x2 + favicon.ico + favicon.svg
+    const total = list.length * (sizes.length + 4);
+    let processed = 0;
+    setProgress({ current: 0, total });
     try {
-      const sizes = parseSizes(sizesStr);
       const zip = new JSZip();
       for (const f of list) {
-        // eslint-disable-next-line no-await-in-loop
-        const img = await imageBitmapFromFile(f);
-        const baseName = (f.name || "image").replace(/\.[^.]+$/, "");
-        const dir = list.length > 1 ? zip.folder(baseName) : zip;
-        const useBg = transparent ? null : bg;
-        for (const size of sizes) {
-          const c = canvasFromImage(img, size, useBg);
-          // eslint-disable-next-line no-await-in-loop
-          const blob = await new Promise((r) => c.toBlob(r, "image/png", 0.92));
-          dir.file(`logo${size}.png`, blob);
+        try {
+           
+          const img = await imageBitmapFromFile(f);
+          const baseName = (f.name || "image").replace(/\.[^.]+$/, "");
+          const dir = list.length > 1 ? zip.folder(baseName) : zip;
+          const useBg = transparent ? null : bg;
+          for (const size of sizes) {
+            const forceOpaqueForMaskable =
+              transparent && maskableSafeBg && MASKABLE_SIZES.has(size);
+            const sizeBg = forceOpaqueForMaskable ? bg || "#ffffff" : useBg;
+            const c = canvasFromImage(img, size, sizeBg);
+             
+            const blob = await new Promise((r) =>
+              c.toBlob(r, "image/png", 0.92)
+            );
+            dir.file(`logo${size}.png`, blob);
+            processed += 1;
+            setProgress({ current: processed, total });
+          }
+          // iOS
+          const iosBg = iosWhiteOnly ? "#ffffff" : useBg;
+          const c180 = canvasFromImage(img, 180, iosBg);
+          dir.file(
+            "apple-touch-icon.png",
+             
+            await new Promise((r) => c180.toBlob(r, "image/png", 0.92))
+          );
+          processed += 1;
+          setProgress({ current: processed, total });
+
+          const c192 = canvasFromImage(img, 192, iosBg);
+          dir.file(
+            "apple-touch-icon-3d.png",
+             
+            await new Promise((r) => c192.toBlob(r, "image/png", 0.92))
+          );
+          processed += 1;
+          setProgress({ current: processed, total });
+
+          // favicon.ico multi-résolution (16/32/48) embarquant du PNG
+           
+          const icoBytes = await buildFaviconIco(img, useBg);
+          dir.file("favicon.ico", icoBytes);
+          processed += 1;
+          setProgress({ current: processed, total });
+
+          // favicon.svg vectoriel (fallback moderne, préféré par les navigateurs)
+          dir.file("favicon.svg", buildSvgFavicon(img, useBg));
+          processed += 1;
+          setProgress({ current: processed, total });
+
+          dir.file("SNIPPET_manifest.json", manifestSnippet);
+          dir.file("SNIPPET_head.html", headSnippet);
+          img.close?.();
+        } catch (e) {
+          throw new Error(
+            `Échec du traitement de "${f.name}": ${e?.message || e}`
+          );
         }
-        // iOS
-        const iosBg = iosWhiteOnly ? "#ffffff" : useBg;
-        const c180 = canvasFromImage(img, 180, iosBg);
-        dir.file(
-          "apple-touch-icon.png",
-          await new Promise((r) => c180.toBlob(r, "image/png", 0.92))
-        );
-        const c192 = canvasFromImage(img, 192, iosBg);
-        dir.file(
-          "apple-touch-icon-3d.png",
-          await new Promise((r) => c192.toBlob(r, "image/png", 0.92))
-        );
-        dir.file("SNIPPET_manifest.json", manifestSnippet);
-        dir.file("SNIPPET_head.html", headSnippet);
       }
       const content = await zip.generateAsync({ type: "blob" });
       saveAs(
         content,
         list.length > 1 ? "icons-pwa-batch.zip" : "icons-pwa.zip"
       );
+    } catch (e) {
+      setError(e?.message || "Une erreur est survenue pendant la génération.");
     } finally {
       setBusy(false);
+      setProgress({ current: 0, total: 0 });
     }
   }, [
     files,
@@ -226,6 +434,7 @@ function App() {
     manifestSnippet,
     headSnippet,
     iosWhiteOnly,
+    maskableSafeBg,
   ]);
 
   return (
@@ -249,10 +458,45 @@ function App() {
       </div>
       <p style={{ color: "#9ca3af", marginTop: 0 }}>
         Charge une image carrée (512×512 recommandé). Fond non transparent
-        conseillé pour iOS.
+        conseillé pour iOS. Le ZIP inclut <code>favicon.ico</code> et{" "}
+        <code>favicon.svg</code> générés automatiquement avec les autres
+        icônes.
       </p>
+
+      {error && (
+        <div
+          role="alert"
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: 12,
+            background: "#3f1d1d",
+            border: "1px solid #7f1d1d",
+            color: "#fecaca",
+            borderRadius: 8,
+            padding: "10px 14px",
+            marginBottom: 16,
+          }}
+        >
+          <span>{error}</span>
+          <button onClick={() => setError("")} aria-label="Fermer l'erreur">
+            ✕
+          </button>
+        </div>
+      )}
+
       <div
         onClick={handlePick}
+        role="button"
+        tabIndex={0}
+        aria-label="Zone de dépôt d'image : cliquer ou glisser-déposer un fichier"
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            handlePick();
+          }
+        }}
         title="Dépose tes images ici ou clique pour sélectionner"
         style={{
           border: "1px dashed #333",
@@ -270,6 +514,45 @@ function App() {
           Mode lot: actif (plusieurs fichiers acceptés)
         </div>
       </div>
+
+      {thumbs.length > 1 && (
+        <div
+          style={{
+            display: "flex",
+            gap: 10,
+            overflowX: "auto",
+            marginBottom: 16,
+            paddingBottom: 4,
+          }}
+        >
+          {thumbs.map((t) => (
+            <button
+              key={t.url}
+              onClick={() => setFile(t.file)}
+              title={t.file.name}
+              aria-pressed={file === t.file}
+              style={{
+                flex: "0 0 auto",
+                padding: 4,
+                borderRadius: 8,
+                border:
+                  file === t.file ? "2px solid #3b82f6" : "1px solid #333",
+                background: "#111",
+                cursor: "pointer",
+              }}
+            >
+              <img
+                src={t.url}
+                alt={t.file.name}
+                width={48}
+                height={48}
+                style={{ borderRadius: 6, objectFit: "contain" }}
+              />
+            </button>
+          ))}
+        </div>
+      )}
+
       <div
         style={{
           display: "flex",
@@ -283,6 +566,7 @@ function App() {
           style={{ display: "none" }}
           type="file"
           accept="image/*"
+          multiple
           onChange={onInputChange}
         />
         <button onClick={handlePick} disabled={busy}>
@@ -295,6 +579,7 @@ function App() {
             value={bg}
             onChange={(e) => setBg(e.target.value)}
             disabled={transparent}
+            aria-label="Couleur de fond personnalisée"
           />
         </label>
         <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
@@ -313,6 +598,7 @@ function App() {
                 background: c,
               }}
               title={c}
+              aria-label={`Utiliser la couleur de fond ${c}`}
             />
           ))}
         </div>
@@ -332,6 +618,18 @@ function App() {
           />
           <span>Fond blanc iOS uniquement</span>
         </label>
+        <label
+          style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
+          title="Évite les icônes Android maskable transparentes (recommandé): 192/512 recevront un fond opaque même si 'Fond transparent' est coché."
+        >
+          <input
+            type="checkbox"
+            checked={maskableSafeBg}
+            onChange={(e) => setMaskableSafeBg(e.target.checked)}
+            disabled={!transparent}
+          />
+          <span>Fond opaque pour icônes maskable (192/512)</span>
+        </label>
         <label style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
           <span>Tailles</span>
           <input
@@ -350,10 +648,15 @@ function App() {
           />
         </label>
         <button onClick={generateZip} disabled={!file || busy}>
-          {busy ? "Génération..." : "Générer ZIP"}
+          {busy
+            ? `Génération... (${progress.current}/${progress.total})`
+            : "Générer ZIP"}
         </button>
         <button onClick={() => setPreviewOpen(true)} disabled={!file}>
           Aperçu iOS/Android
+        </button>
+        <button onClick={resetSettings} disabled={busy} title="Revenir aux réglages par défaut">
+          Réinitialiser
         </button>
       </div>
 
@@ -446,17 +749,36 @@ function App() {
                 >
                   {[192, 512].map((s, i) => (
                     <div key={i} style={{ textAlign: "center" }}>
-                      <img
-                        src={previews[i === 0 ? 1 : 2]}
-                        alt="android"
+                      <div
                         style={{
+                          position: "relative",
                           width: s / 2,
                           height: s / 2,
-                          borderRadius: 24,
-                          border: "1px solid #333",
-                          background: "#111",
                         }}
-                      />
+                      >
+                        <img
+                          src={previews[i === 0 ? 1 : 2]}
+                          alt="android"
+                          style={{
+                            width: "100%",
+                            height: "100%",
+                            borderRadius: 24,
+                            border: "1px solid #333",
+                            background: "#111",
+                          }}
+                        />
+                        {/* Zone de sécurité maskable (~80% central, cf. spécification Android) */}
+                        <div
+                          style={{
+                            position: "absolute",
+                            inset: "10%",
+                            border: "1px dashed rgba(59,130,246,0.7)",
+                            borderRadius: "50%",
+                            pointerEvents: "none",
+                          }}
+                          title="Zone de sécurité maskable (~80%)"
+                        />
+                      </div>
                       <div style={{ color: "#9ca3af", marginTop: 6 }}>
                         {s} maskable
                       </div>
@@ -518,7 +840,17 @@ function App() {
           style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}
         >
           <div>
-            <div style={{ marginBottom: 8, fontWeight: 600 }}>Manifest PWA</div>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: 8,
+              }}
+            >
+              <span style={{ fontWeight: 600 }}>Manifest PWA</span>
+              <CopyButton text={manifestSnippet} />
+            </div>
             <textarea
               readOnly
               value={manifestSnippet}
@@ -545,8 +877,16 @@ function App() {
             </p>
           </div>
           <div>
-            <div style={{ marginBottom: 8, fontWeight: 600 }}>
-              Balises &lt;head&gt;
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: 8,
+              }}
+            >
+              <span style={{ fontWeight: 600 }}>Balises &lt;head&gt;</span>
+              <CopyButton text={headSnippet} />
             </div>
             <textarea
               readOnly
@@ -562,7 +902,8 @@ function App() {
               }}
             />
             <p style={{ color: "#9ca3af", fontSize: 13, marginTop: 8 }}>
-              Utilité: favicons d’onglet (16/32/48), fallback
+              Utilité: favicons d’onglet (16/32/48), favicon vectoriel
+              <code> favicon.svg</code>, fallback
               <code> favicon.ico</code> et icônes iOS (
               <code>apple-touch-*</code>) utilisées par Safari iOS. À placer
               dans le &lt;head&gt; de
