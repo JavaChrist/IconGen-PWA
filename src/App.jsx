@@ -21,9 +21,68 @@ const DEFAULT_SETTINGS = {
   sizesStr: SIZES.join(","),
   iosWhiteOnly: false,
   maskableSafeBg: true,
+  autoCrop: true,
+  zoomPercent: 100,
 };
 
-function canvasFromImage(img, size, background = "#ffffff") {
+// Détecte la zone réellement visible du logo (hors marges transparentes ou
+// unies) afin que le contenu remplisse mieux le cadre, surtout aux petites
+// tailles (favicon 16/32px) où un logo "perdu" dans ses marges devient
+// illisible.
+function getVisibleBoundingBox(img, alphaThreshold = 10, colorTolerance = 24) {
+  const off = document.createElement("canvas");
+  off.width = img.width;
+  off.height = img.height;
+  const ctx = off.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0);
+  const { data, width, height } = ctx.getImageData(0, 0, img.width, img.height);
+
+  let hasAlpha = false;
+  for (let i = 3; i < data.length; i += 4) {
+    if (data[i] < 255) {
+      hasAlpha = true;
+      break;
+    }
+  }
+
+  const bgR = data[0];
+  const bgG = data[1];
+  const bgB = data[2];
+
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4;
+      let isContent;
+      if (hasAlpha) {
+        isContent = data[idx + 3] > alphaThreshold;
+      } else {
+        const dr = Math.abs(data[idx] - bgR);
+        const dg = Math.abs(data[idx + 1] - bgG);
+        const db = Math.abs(data[idx + 2] - bgB);
+        isContent = dr > colorTolerance || dg > colorTolerance || db > colorTolerance;
+      }
+      if (isContent) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (maxX < minX || maxY < minY) {
+    return { x: 0, y: 0, width, height };
+  }
+  return { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 };
+}
+
+function canvasFromImage(img, size, background = "#ffffff", options = {}) {
+  const { cropRect = null, zoomPercent = 100 } = options;
   const canvas = document.createElement("canvas");
   canvas.width = size;
   canvas.height = size;
@@ -33,14 +92,19 @@ function canvasFromImage(img, size, background = "#ffffff") {
     ctx.fillRect(0, 0, size, size);
   }
 
-  // contain fit
-  const ratio = Math.min(size / img.width, size / img.height);
-  const w = Math.round(img.width * ratio);
-  const h = Math.round(img.height * ratio);
+  const sx = cropRect ? cropRect.x : 0;
+  const sy = cropRect ? cropRect.y : 0;
+  const sw = cropRect ? cropRect.width : img.width;
+  const sh = cropRect ? cropRect.height : img.height;
+
+  // contain fit (+ zoom optionnel, qui peut légèrement rogner les bords)
+  const ratio = Math.min(size / sw, size / sh) * ((zoomPercent || 100) / 100);
+  const w = Math.round(sw * ratio);
+  const h = Math.round(sh * ratio);
   const x = Math.round((size - w) / 2);
   const y = Math.round((size - h) / 2);
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(img, x, y, w, h);
+  ctx.drawImage(img, sx, sy, sw, sh, x, y, w, h);
   return canvas;
 }
 
@@ -48,6 +112,15 @@ async function imageBitmapFromFile(file) {
   const arrayBuf = await file.arrayBuffer();
   const blob = new Blob([arrayBuf]);
   return await createImageBitmap(blob);
+}
+
+function computeCropRect(img, enabled) {
+  if (!enabled) return null;
+  try {
+    return getVisibleBoundingBox(img);
+  } catch {
+    return null;
+  }
 }
 
 // Construit un fichier .ico (format ICONDIR) contenant plusieurs images PNG
@@ -89,13 +162,11 @@ function buildIco(pngEntries) {
 
 const FAVICON_SIZES = [16, 32, 48];
 
-async function buildFaviconIco(img, background) {
+async function buildFaviconIco(img, background, options = {}) {
   const entries = [];
   for (const size of FAVICON_SIZES) {
-    const c = canvasFromImage(img, size, background);
-     
+    const c = canvasFromImage(img, size, background, options);
     const blob = await new Promise((r) => c.toBlob(r, "image/png"));
-     
     const buffer = await blob.arrayBuffer();
     entries.push({ width: size, height: size, buffer });
   }
@@ -104,8 +175,8 @@ async function buildFaviconIco(img, background) {
 
 // Favicon vectoriel: encapsule un PNG haute résolution dans un conteneur SVG.
 // Les navigateurs modernes le préfèrent au .ico et l'affichent net à toute taille.
-function buildSvgFavicon(img, background, size = 512) {
-  const canvas = canvasFromImage(img, size, background);
+function buildSvgFavicon(img, background, options = {}, size = 512) {
+  const canvas = canvasFromImage(img, size, background, options);
   const dataUrl = canvas.toDataURL("image/png");
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}"><image width="${size}" height="${size}" href="${dataUrl}"/></svg>`;
 }
@@ -146,6 +217,10 @@ function App() {
   );
   const [maskableSafeBg, setMaskableSafeBg] = useState(
     DEFAULT_SETTINGS.maskableSafeBg
+  );
+  const [autoCrop, setAutoCrop] = useState(DEFAULT_SETTINGS.autoCrop);
+  const [zoomPercent, setZoomPercent] = useState(
+    DEFAULT_SETTINGS.zoomPercent
   );
   const [busy, setBusy] = useState(false);
   const [previews, setPreviews] = useState([]);
@@ -204,8 +279,10 @@ function App() {
           return arr.map((f) => ({ file: f, url: URL.createObjectURL(f) }));
         });
         const img = await imageBitmapFromFile(arr[0]);
+        const cropRect = computeCropRect(img, autoCrop);
+        const opts = { cropRect, zoomPercent };
         const pv = [64, 192, 512].map((s) =>
-          canvasFromImage(img, s, transparent ? null : bg).toDataURL(
+          canvasFromImage(img, s, transparent ? null : bg, opts).toDataURL(
             "image/png"
           )
         );
@@ -219,7 +296,7 @@ function App() {
         );
       }
     },
-    [bg, transparent]
+    [bg, transparent, autoCrop, zoomPercent]
   );
 
   const onInputChange = useCallback((e) => onFiles(e.target.files), [onFiles]);
@@ -266,8 +343,10 @@ function App() {
       if (!file) return;
       try {
         const img = await imageBitmapFromFile(file);
+        const cropRect = computeCropRect(img, autoCrop);
+        const opts = { cropRect, zoomPercent };
         const pv = [64, 192, 512].map((s) =>
-          canvasFromImage(img, s, transparent ? null : bg).toDataURL(
+          canvasFromImage(img, s, transparent ? null : bg, opts).toDataURL(
             "image/png"
           )
         );
@@ -279,7 +358,7 @@ function App() {
         );
       }
     })();
-  }, [bg, transparent, file]);
+  }, [bg, transparent, file, autoCrop, zoomPercent]);
 
   // LocalStorage: charger
   useEffect(() => {
@@ -294,6 +373,8 @@ function App() {
           setIosWhiteOnly(s.iosWhiteOnly);
         if (typeof s.maskableSafeBg === "boolean")
           setMaskableSafeBg(s.maskableSafeBg);
+        if (typeof s.autoCrop === "boolean") setAutoCrop(s.autoCrop);
+        if (typeof s.zoomPercent === "number") setZoomPercent(s.zoomPercent);
       }
     } catch {
       // paramètres locaux corrompus ou indisponibles: on ignore et garde les valeurs par défaut
@@ -311,12 +392,22 @@ function App() {
           sizesStr,
           iosWhiteOnly,
           maskableSafeBg,
+          autoCrop,
+          zoomPercent,
         })
       );
     } catch {
       // stockage indisponible (mode privé, quota atteint...): on ignore silencieusement
     }
-  }, [bg, transparent, sizesStr, iosWhiteOnly, maskableSafeBg]);
+  }, [
+    bg,
+    transparent,
+    sizesStr,
+    iosWhiteOnly,
+    maskableSafeBg,
+    autoCrop,
+    zoomPercent,
+  ]);
 
   const resetSettings = useCallback(() => {
     setBg(DEFAULT_SETTINGS.bg);
@@ -324,6 +415,8 @@ function App() {
     setSizesStr(DEFAULT_SETTINGS.sizesStr);
     setIosWhiteOnly(DEFAULT_SETTINGS.iosWhiteOnly);
     setMaskableSafeBg(DEFAULT_SETTINGS.maskableSafeBg);
+    setAutoCrop(DEFAULT_SETTINGS.autoCrop);
+    setZoomPercent(DEFAULT_SETTINGS.zoomPercent);
     setError("");
     try {
       localStorage.removeItem("icongenSettings");
@@ -355,8 +448,9 @@ function App() {
       const zip = new JSZip();
       for (const f of list) {
         try {
-           
           const img = await imageBitmapFromFile(f);
+          const cropRect = computeCropRect(img, autoCrop);
+          const opts = { cropRect, zoomPercent };
           const baseName = (f.name || "image").replace(/\.[^.]+$/, "");
           const dir = list.length > 1 ? zip.folder(baseName) : zip;
           const useBg = transparent ? null : bg;
@@ -364,8 +458,7 @@ function App() {
             const forceOpaqueForMaskable =
               transparent && maskableSafeBg && MASKABLE_SIZES.has(size);
             const sizeBg = forceOpaqueForMaskable ? bg || "#ffffff" : useBg;
-            const c = canvasFromImage(img, size, sizeBg);
-             
+            const c = canvasFromImage(img, size, sizeBg, opts);
             const blob = await new Promise((r) =>
               c.toBlob(r, "image/png", 0.92)
             );
@@ -375,33 +468,30 @@ function App() {
           }
           // iOS
           const iosBg = iosWhiteOnly ? "#ffffff" : useBg;
-          const c180 = canvasFromImage(img, 180, iosBg);
+          const c180 = canvasFromImage(img, 180, iosBg, opts);
           dir.file(
             "apple-touch-icon.png",
-             
             await new Promise((r) => c180.toBlob(r, "image/png", 0.92))
           );
           processed += 1;
           setProgress({ current: processed, total });
 
-          const c192 = canvasFromImage(img, 192, iosBg);
+          const c192 = canvasFromImage(img, 192, iosBg, opts);
           dir.file(
             "apple-touch-icon-3d.png",
-             
             await new Promise((r) => c192.toBlob(r, "image/png", 0.92))
           );
           processed += 1;
           setProgress({ current: processed, total });
 
           // favicon.ico multi-résolution (16/32/48) embarquant du PNG
-           
-          const icoBytes = await buildFaviconIco(img, useBg);
+          const icoBytes = await buildFaviconIco(img, useBg, opts);
           dir.file("favicon.ico", icoBytes);
           processed += 1;
           setProgress({ current: processed, total });
 
           // favicon.svg vectoriel (fallback moderne, préféré par les navigateurs)
-          dir.file("favicon.svg", buildSvgFavicon(img, useBg));
+          dir.file("favicon.svg", buildSvgFavicon(img, useBg, opts));
           processed += 1;
           setProgress({ current: processed, total });
 
@@ -435,6 +525,8 @@ function App() {
     headSnippet,
     iosWhiteOnly,
     maskableSafeBg,
+    autoCrop,
+    zoomPercent,
   ]);
 
   return (
@@ -460,7 +552,10 @@ function App() {
         Charge une image carrée (512×512 recommandé). Fond non transparent
         conseillé pour iOS. Le ZIP inclut <code>favicon.ico</code> et{" "}
         <code>favicon.svg</code> générés automatiquement avec les autres
-        icônes.
+        icônes. Si le favicon te paraît trop petit/discret, le{" "}
+        <strong>recadrage auto</strong> et le curseur <strong>Zoom</strong>{" "}
+        ci-dessous permettent de faire remplir davantage le cadre par ton
+        logo.
       </p>
 
       {error && (
@@ -629,6 +724,31 @@ function App() {
             disabled={!transparent}
           />
           <span>Fond opaque pour icônes maskable (192/512)</span>
+        </label>
+        <label
+          style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
+          title="Retire automatiquement les marges vides/transparentes autour du logo pour qu'il remplisse mieux les petites icônes (favicon)."
+        >
+          <input
+            type="checkbox"
+            checked={autoCrop}
+            onChange={(e) => setAutoCrop(e.target.checked)}
+          />
+          <span>Recadrage auto (retire les marges vides)</span>
+        </label>
+        <label
+          style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
+          title="Zoom supplémentaire sur le logo (peut légèrement rogner les bords). Utile si le favicon reste trop petit après le recadrage auto."
+        >
+          <span>Zoom ({zoomPercent}%)</span>
+          <input
+            type="range"
+            min={100}
+            max={200}
+            step={5}
+            value={zoomPercent}
+            onChange={(e) => setZoomPercent(Number(e.target.value))}
+          />
         </label>
         <label style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
           <span>Tailles</span>
